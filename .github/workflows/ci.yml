@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel previous runs on the same PR / branch when new commits arrive.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.config }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Release, Debug]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        run: cmake -S src -B build -G "Ninja Multi-Config"
+
+      - name: Build ${{ matrix.config }}
+        run: cmake --build build --config ${{ matrix.config }}
+
+      # The test targets are EXCLUDE_FROM_ALL, so build them explicitly before ctest.
+      - name: Build tests ${{ matrix.config }}
+        run: cmake --build build --config ${{ matrix.config }} --target baestim_minijson_test baestim_remoteconfig_test baestim_appupdater_test
+
+      - name: Test ${{ matrix.config }}
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+
+      - name: Upload artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BaeStim-${{ matrix.config }}-pr${{ github.event.pull_request.number || github.run_number }}
+          # Ship only the three shipped DLLs; the test binary and other build
+          # outputs (built for ctest above) must not leak into the artifact.
+          path: |
+            build/${{ matrix.config }}/BaeStim.dll
+            build/${{ matrix.config }}/dwmapi.dll
+            build/${{ matrix.config }}/xinput1_4.dll
+          retention-days: 7
