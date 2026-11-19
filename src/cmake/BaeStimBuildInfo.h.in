@@ -1,0 +1,3 @@
+#pragma once
+
+#define BAESTIM_VERSION "@BAESTIM_VERSION@"

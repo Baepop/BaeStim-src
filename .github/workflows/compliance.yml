@@ -1,0 +1,141 @@
+name: GPL compliance snapshot
+
+# BaeStim links against and ships Steam's proprietary DLLs, so every release we
+# distribute is a GPL-licensed derivative work. GPL requires us to offer the
+# complete corresponding source of each released version, so for every release
+# tag we publish the exact tree of that tag to the public repo
+# Baepop/BaeStim-src (this repo stays the development repo).
+#
+# Each tag gets its own branch there (`snapshot/<tag>`, e.g. `snapshot/v2.0.1`),
+# so a version's source stays retrievable forever instead of being overwritten
+# by the next release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (defaults to the ref this run points at)"
+        required: false
+        type: string
+
+# We only need to read this repo; the push to the public repo authenticates with
+# the COMPLIANCE_PAT secret, not with GITHUB_TOKEN.
+permissions:
+  contents: read
+
+# Each tag owns its `snapshot/<tag>` branch, so two different tags cannot clobber
+# each other. The group is kept so that a re-run for the same tag never races an
+# in-flight run for that tag (queued, not cancelled — a cancelled run could leave
+# the public repo without a snapshot for its tag).
+concurrency:
+  group: compliance-baestim-src
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish source snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Resolve tag
+        id: resolve
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-${GITHUB_REF_NAME:-}}"
+          if [[ -z "${tag}" ]]; then
+            echo "::error::No tag to publish: give the workflow_dispatch input or run it on a tag."
+            exit 1
+          fi
+          # The tag ends up in a shell variable and in a commit message; reject
+          # anything that is not a plain git ref name so a crafted tag cannot
+          # break the run (values are passed via env, never interpolated).
+          if [[ ! "${tag}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Refusing to publish suspicious tag name '${tag}'."
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the exact tag tree
+        uses: actions/checkout@v4
+        with:
+          # Publish the tree of this one tag only: the public repo gets a single
+          # synthetic commit, so no history is needed here.
+          fetch-depth: 1
+          ref: ${{ steps.resolve.outputs.tag }}
+          # Do not leave the private repo's token in .git; the push step uses
+          # its own credential.
+          persist-credentials: false
+
+      - name: Build source snapshot
+        id: snapshot
+        run: |
+          set -euo pipefail
+          # GPL compliance means shipping the "preferred form of the work for
+          # making modifications" of what we actually distribute: the code that
+          # is compiled into BaeStim.dll, plus its build, test, docs and CI
+          # machinery (`.github/` included — the workflows are part of how the
+          # released binaries are produced).
+          #
+          # EXCLUDED: `supabase/` is the owner's own separate backend service
+          # (Postgres schema + edge functions). It is not derived from Steam's
+          # binaries, is not linked into the shipped DLLs and is not part of
+          # this work, so the GPL does not reach it; the owner decided to keep
+          # it closed. Keeping it out of the public snapshot is what makes this
+          # publication safe to point users at.
+          rm -rf .git
+          rm -rf supabase
+
+          # Fresh single-commit history: each public branch mirrors one release
+          # tree, not our private development history. The local branch name is
+          # irrelevant because the push targets `refs/heads/snapshot/<tag>`.
+          git init --initial-branch=main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "BaeStim source snapshot for tag ${TAG}"
+
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+
+      - name: Push snapshot to Baepop/BaeStim-src
+        env:
+          COMPLIANCE_PAT: ${{ secrets.COMPLIANCE_PAT }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # The remote is added (not inlined in the push) so that a failure never
+          # echoes the tokenised URL into the log.
+          git remote add public "https://x-access-token:${COMPLIANCE_PAT}@github.com/Baepop/BaeStim-src.git"
+
+          # One branch per release tag: `snapshot/<tag>`. Every released version
+          # therefore keeps its exact source published forever, which is what the
+          # GPL offer requires for each version we actually distribute.
+          #
+          # --force is safe and intended: each tag owns its branch and each
+          # snapshot is an unrelated root commit, so nothing can fast forward.
+          # Re-running the same tag re-publishes the same tree (only the synthetic
+          # commit SHA changes), and a file removed for legal reasons actually
+          # disappears from that branch instead of lingering in history.
+          git push --force public "HEAD:refs/heads/snapshot/${TAG}"
+
+      - name: Job summary
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+          SNAPSHOT_SHA: ${{ steps.snapshot.outputs.sha }}
+        run: |
+          {
+            echo "### GPL compliance snapshot published"
+            echo ""
+            echo "- Tag: \`${TAG}\`"
+            echo "- Branch: [\`snapshot/${TAG}\`](https://github.com/Baepop/BaeStim-src/tree/snapshot/${TAG})"
+            echo "- Snapshot commit: [\`${SNAPSHOT_SHA}\`](https://github.com/Baepop/BaeStim-src/commit/${SNAPSHOT_SHA})"
+            echo "- Public repo: https://github.com/Baepop/BaeStim-src (branch \`snapshot/${TAG}\`, kept permanently)"
+            echo ""
+            echo "Every released tag keeps its own permanent, retrievable source snapshot on this branch."
+            echo "\`supabase/\` (owner's separate backend) is intentionally excluded from the snapshot."
+          } >> "$GITHUB_STEP_SUMMARY"
